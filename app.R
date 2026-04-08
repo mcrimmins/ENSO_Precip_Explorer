@@ -1,3 +1,56 @@
+# ============================================================
+# ENSO–Precipitation Explorer for U.S. Climate Divisions
+# ------------------------------------------------------------
+# Author: Mike Crimmins/ ChatGPT
+# Affiliation: University of Arizona
+# Contact: crimmins@arizona.edu
+#
+# Description:
+# This Shiny application explores relationships between ENSO
+# variability (via the CPC Relative Oceanic Niño Index, RONI)
+# and seasonal precipitation across NOAA climate divisions.
+#
+# The app allows users to:
+#   - Select a state and climate division
+#   - Choose a 3-month season (e.g., DJF, JAS)
+#   - Visualize ENSO–precipitation relationships via:
+#       * Scatterplots (RONI vs. precipitation)
+#       * Seasonal anomaly bar charts
+#       * Spatial correlation maps
+#   - Download plots and data subsets
+#
+# Data Sources:
+#   - NOAA nClimDiv monthly precipitation dataset
+#     https://www.ncei.noaa.gov/pub/data/cirs/climdiv/
+#   - CPC Relative Oceanic Niño Index (RONI)
+#     https://www.cpc.ncep.noaa.gov/data/indices/
+#
+# Key Processing Steps:
+#   1. Download latest nClimDiv precipitation file
+#   2. Parse fixed-width divisional data (wide format)
+#   3. Aggregate monthly data into seasonal totals
+#      - Handles cross-year seasons (DJF, NDJ)
+#   4. Download and parse CPC RONI data
+#   5. Join ENSO and precipitation by season/year
+#   6. Compute correlations and generate visualizations
+#
+# Notes:
+#   - Seasons follow CPC convention:
+#       DJF 2005 = Dec 2004 + Jan 2005 + Feb 2005
+#       NDJ 2005 = Nov 2004 + Dec 2004 + Jan 2005
+#   - ENSO classification:
+#       El Niño  >=  0.5
+#       La Niña  <= -0.5
+#       Neutral  otherwise
+#   - Data files are cached locally in /cache
+#
+# Requirements:
+#   shiny, tidyverse, sf, leaflet, plotly, data.table,
+#   ggrepel, janitor, rvest
+#
+# Last Updated: <DATE>
+# ============================================================
+
 library(shiny)
 library(shinycssloaders)
 library(tidyverse)
@@ -109,6 +162,81 @@ normalize_enso_class <- function(x) {
     TRUE ~ "Neutral"
   )
 }
+
+#### Debug
+
+export_debug_tables <- function(monthly_precip, lookup, roni_df, state_code, division, season,
+                                out_dir = "debug_exports", years = NULL) {
+  dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  if (is.null(years)) {
+    years <- sort(unique(roni_df$year))
+  }
+  
+  monthly_subset <- monthly_precip |>
+    dplyr::filter(state_code == !!state_code, division == !!division)
+  
+  seasonal_subset <- make_seasonal_precip(monthly_precip, season) |>
+    dplyr::filter(state_code == !!state_code, division == !!division)
+  
+  roni_subset <- roni_df |>
+    dplyr::filter(season == !!season)
+  
+  plot_subset <- make_plot_dataset(
+    monthly_precip = monthly_precip,
+    lookup = lookup,
+    roni_df = roni_df,
+    state_code = state_code,
+    division = division,
+    season = season
+  )
+  
+  if (!is.null(years)) {
+    monthly_subset <- monthly_subset |>
+      dplyr::filter(year %in% c(years, years - 1))
+    
+    seasonal_subset <- seasonal_subset |>
+      dplyr::filter(year %in% years)
+    
+    roni_subset <- roni_subset |>
+      dplyr::filter(year %in% years)
+    
+    plot_subset <- plot_subset |>
+      dplyr::filter(year %in% years)
+  }
+  
+  tag <- paste0("state", state_code, "_div", division, "_", season)
+  
+  readr::write_csv(
+    monthly_subset,
+    file.path(out_dir, paste0(tag, "_monthly_raw.csv"))
+  )
+  
+  readr::write_csv(
+    seasonal_subset,
+    file.path(out_dir, paste0(tag, "_seasonal_precip.csv"))
+  )
+  
+  readr::write_csv(
+    roni_subset,
+    file.path(out_dir, paste0(tag, "_roni.csv"))
+  )
+  
+  readr::write_csv(
+    plot_subset,
+    file.path(out_dir, paste0(tag, "_plot_dataset.csv"))
+  )
+  
+  invisible(list(
+    monthly = monthly_subset,
+    seasonal = seasonal_subset,
+    roni = roni_subset,
+    plot = plot_subset
+  ))
+}
+
+####
+
 
 # -----------------------------
 # Shapefile / lookup
@@ -362,6 +490,7 @@ ui <- fluidPage(
       br(),
       downloadButton("download_plot", "Download PNG"),
       downloadButton("download_data", "Download CSV"),
+      #actionButton("export_debug", "Export debug tables"),
       br(), br(),
       div(
         class = "small-note",
@@ -374,7 +503,8 @@ ui <- fluidPage(
         tags$b("Contact:"), tags$br(),
         "Mike Crimmins", tags$br(),
         "University of Arizona", tags$br(),
-        tags$a(href = "mailto:crimmins@arizona.edu", "crimmins@arizona.edu")
+        tags$a(href = "mailto:crimmins@arizona.edu", "crimmins@arizona.edu"), tags$br(),
+        tags$a(href = "https://cales.arizona.edu/climate/", target = "_blank", "cales.arizona.edu/climate")
       )
     ),
     mainPanel(
@@ -389,6 +519,11 @@ ui <- fluidPage(
         tabPanel(
           "Scatterplot",
           plotlyOutput("scatter_plot", height = 760) |> shinycssloaders::withSpinner()
+        ),
+        tabPanel(
+          "Anomalies",
+          br(),
+          plotlyOutput("anomaly_plot", height = 700) |> shinycssloaders::withSpinner()
         ),
         tabPanel(
           "Data",
@@ -666,9 +801,9 @@ server <- function(input, output, session) {
         fontface = "bold",
         label = glue(
           "Relative Oceanic Nino Index\n",
-          "{input$season}\n",
-          "{min(df$year)}-{max(df$year)}\n",
-          "corr = {round(corr_val, 3)}"
+          "  {input$season}\n",
+          "  {min(df$year)}-{max(df$year)}\n",
+          "  corr = {round(corr_val, 3)}"
         )
       )
     
@@ -971,30 +1106,36 @@ LIMITATIONS
           subtitle = info$division_name,
           x = "Seasonal Average RONI",
           y = "Seasonal Total Precipitation (in.)",
-          color = NULL
+          color = NULL,
+          caption = "University of Arizona -- Climate Science Applications Program -- https://cales.arizona.edu/climate/"
         ) +
         theme_bw(base_size = 13) +
         theme(
           plot.title = element_text(face = "bold"),
           legend.position = c(0.88, 0.12),
           legend.background = element_rect(fill = alpha("white", 0.9), color = "black"),
-          panel.grid.minor = element_blank()
-        ) +
+          panel.grid.minor = element_blank(),
+          plot.caption = element_text(size = 8, hjust = 0.5, color = "gray30"),
+          plot.caption.position = "plot",
+          plot.margin = margin(10, 10, 18, 10)
+        )+
         annotate(
           "label",
           x = -Inf,
           y = Inf,
-          hjust = -0.05,
-          vjust = 1.1,
-          size = 4.2,
+          hjust = 0,
+          vjust = 1,
+          size = 3.8,
           label.size = 0.4,
-          label.padding = unit(0.25, "lines"),
+          label.padding = unit(0.3, "lines"),
+          label.r = unit(0.15, "lines"),
+          fill = alpha("white", 0.9),
           fontface = "bold",
           label = glue(
-            "Relative Oceanic Nino Index\n",
+            "Relative Oceanic Niño Index\n",
             "{input$season}\n",
             "{min(df$year)}-{max(df$year)}\n",
-            "corr = {round(corr_val, 3)}"
+            "r = {round(corr_val, 3)}"
           )
         )
       
@@ -1021,6 +1162,108 @@ LIMITATIONS
       ggplot2::ggsave(file, plot = p, width = 12, height = 9, dpi = 300)
     }
   )
+  
+  ##### Anomalies TS plot
+  output$anomaly_plot <- plotly::renderPlotly({
+    df <- plot_df()
+    req(nrow(df) > 0)
+    
+    info <- selected_info()
+    req(nrow(info) == 1)
+    
+    mean_precip <- mean(df$seasonal_precip_in, na.rm = TRUE)
+    
+    plot_df_anom <- df |>
+      dplyr::mutate(
+        precip_anomaly = seasonal_precip_in - mean_precip,
+        year_f = factor(year, levels = sort(unique(year))),
+        hover_txt = paste0(
+          "Year: ", year,
+          "<br>Season: ", season,
+          "<br>RONI: ", sprintf("%.2f", roni),
+          "<br>Seasonal precip: ", sprintf("%.2f in.", seasonal_precip_in),
+          "<br>Anomaly: ", sprintf("%.2f in.", precip_anomaly),
+          "<br>ENSO: ", as.character(enso_class)
+        )
+      )
+    
+    year_levels <- levels(plot_df_anom$year_f)
+    year_breaks <- year_levels[seq(1, length(year_levels), by = 2)]
+    
+    p <- ggplot(
+      plot_df_anom,
+      aes(
+        x = year_f,
+        y = precip_anomaly,
+        fill = enso_class,
+        text = hover_txt
+      )
+    ) +
+      geom_col(width = 0.8) +
+      geom_hline(yintercept = 0, color = "black", linewidth = 0.7) +
+      scale_fill_manual(values = ENSO_COLORS, drop = FALSE) +
+      scale_x_discrete(breaks = year_breaks) +
+      labs(
+        title = glue("{info$state_name}, Climate Division {info$division}: {input$season} Precipitation Anomalies"),
+        subtitle = info$division_name,
+        x = "Year",
+        y = "Precipitation Anomaly (in.)",
+        fill = NULL
+      ) +
+      theme_bw(base_size = 13) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()
+      )
+    
+    plotly::ggplotly(p, tooltip = "text") |>
+      plotly::layout(
+        legend = list(
+          orientation = "h",
+          x = 0.5,
+          xanchor = "center",
+          y = 1.08
+        ),
+        margin = list(t = 90)
+      )
+  })
+  
+  #####
+  
+  
+  #### debug
+  
+  observeEvent(input$export_debug, {
+    req(monthly_precip(), div_lookup(), roni_data(), input$state, input$division, input$season)
+    
+    sel_state <- as.integer(input$state)
+    sel_div <- as.integer(input$division)
+    sel_season <- input$season
+    yrs <- input$year_range[1]:input$year_range[2]
+    
+    export_debug_tables(
+      monthly_precip = monthly_precip(),
+      lookup = div_lookup(),
+      roni_df = roni_data(),
+      state_code = sel_state,
+      division = sel_div,
+      season = sel_season,
+      out_dir = "debug_exports",
+      years = yrs
+    )
+    
+    message(
+      sprintf(
+        "Debug tables exported to debug_exports/ for state=%s division=%s season=%s",
+        sel_state, sel_div, sel_season
+      )
+    )
+  })
+  
+  ####
+  
 }
 
 shinyApp(ui, server)
